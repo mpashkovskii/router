@@ -58,6 +58,29 @@ impl VllmPDRouter {
         )
     }
 
+    /// Parse ZMQ metadata string to extract handshake and notify ports
+    /// Format: "handshake:6301,notify:61005"
+    fn parse_zmq_metadata(zmq_metadata: &str) -> (u16, u16) {
+        let mut handshake_port = 6301; // Default
+        let mut notify_port = 61005;   // Default
+
+        for part in zmq_metadata.split(',') {
+            let kv: Vec<&str> = part.split(':').collect();
+            if kv.len() == 2 {
+                let key = kv[0].trim();
+                if let Ok(port) = kv[1].trim().parse::<u16>() {
+                    match key {
+                        "handshake" => handshake_port = port,
+                        "notify" => notify_port = port,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        (handshake_port, notify_port)
+    }
+
     /// Get ZMQ address for a worker URL using service discovery
     fn get_zmq_address(&self, http_url: &str, service_type: ServiceType) -> String {
         // Extract just the host:port from the URL
@@ -368,15 +391,29 @@ impl VllmPDRouter {
         // Prepare prefill request (max_tokens=1 to force prefill-only mode)
         let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
 
-        // Add kv_transfer_params for NixlConnector support at top level
+        // Parse decode instance's ZMQ metadata (format: "handshake:6301,notify:61005")
+        let (decode_handshake_port, decode_notify_port) = Self::parse_zmq_metadata(decode_zmq);
+
+        // Extract decode IP from HTTP address
+        let decode_ip = decode_http
+            .split("://")
+            .nth(1)
+            .unwrap_or(decode_http)
+            .split(':')
+            .next()
+            .unwrap_or("localhost");
+
+        // Add kv_transfer_params for MoRIIO support at top level
         // This enables the prefill instance to prepare for remote decode
         prefill_request["kv_transfer_params"] = json!({
             "do_remote_decode": true,
             "do_remote_prefill": false,
+            "remote_handshake_port": decode_handshake_port,
+            "remote_notify_port": decode_notify_port,
             "remote_engine_id": serde_json::Value::Null,
             "remote_block_ids": serde_json::Value::Null,
-            "remote_host": serde_json::Value::Null,
-            "remote_port": serde_json::Value::Null
+            "remote_host": decode_ip,
+            "remote_port": decode_handshake_port  // Use handshake port as remote_port
         });
 
         debug!("Added kv_transfer_params to prefill request for NixlConnector support");

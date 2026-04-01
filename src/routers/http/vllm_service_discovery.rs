@@ -9,7 +9,9 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 /// Default ping timeout in seconds
-const DEFAULT_PING_SECONDS: u64 = 5;
+/// Workers send heartbeats every 5 seconds, so timeout should be 2-3x longer
+/// to avoid race conditions and allow for network jitter
+const DEFAULT_PING_SECONDS: u64 = 15;
 
 /// Service type for registration
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -27,13 +29,23 @@ impl std::fmt::Display for ServiceType {
     }
 }
 
-/// Service registration data
+/// Service registration data matching vLLM's MoRIIO connector format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRegistration {
     #[serde(rename = "type")]
-    pub service_type: String, // "P" or "D"
-    pub http_address: String,
-    pub zmq_address: String,
+    pub service_type: String, // "register"
+    pub role: String,         // "P" or "D"
+    #[serde(default)]
+    pub index: Option<String>,
+    pub request_address: String, // HTTP endpoint
+    pub handshake_port: u16,
+    pub notify_port: u16,
+    #[serde(default)]
+    pub dp_size: Option<u32>,
+    #[serde(default)]
+    pub tp_size: Option<u32>,
+    #[serde(default)]
+    pub transfer_mode: Option<String>, // "READ" or "WRITE"
 }
 
 /// Service instance with expiration timestamp
@@ -153,57 +165,69 @@ impl ServiceRegistry {
             }
         };
 
+        // Only process "register" type messages
+        if data.service_type != "register" {
+            return;
+        }
+
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
+        // Build ZMQ address from handshake_port and notify_port
+        // Format: "handshake:6301,notify:61005"
+        let zmq_address = format!(
+            "handshake:{},notify:{}",
+            data.handshake_port, data.notify_port
+        );
+
         let instance = ServiceInstance {
-            zmq_address: data.zmq_address.clone(),
+            zmq_address: zmq_address.clone(),
             expires_at: current_time + DEFAULT_PING_SECONDS,
         };
 
         let remote_addr_str = String::from_utf8_lossy(remote_address);
 
-        match data.service_type.as_str() {
+        match data.role.as_str() {
             "P" => {
                 let mut prefill = prefill_instances.lock().unwrap();
-                let is_new = !prefill.contains_key(&data.http_address);
-                prefill.insert(data.http_address.clone(), instance);
+                let is_new = !prefill.contains_key(&data.request_address);
+                prefill.insert(data.request_address.clone(), instance);
 
                 if is_new {
                     info!(
-                        "🔵Add Prefill [HTTP:{}, ZMQ:{}]",
-                        data.http_address, data.zmq_address
+                        "🔵Add Prefill [HTTP:{}, handshake:{}, notify:{}]",
+                        data.request_address, data.handshake_port, data.notify_port
                     );
                 } else {
                     debug!(
-                        "🔄Update Prefill [HTTP:{}, ZMQ:{}]",
-                        data.http_address, data.zmq_address
+                        "🔄Update Prefill [HTTP:{}, handshake:{}, notify:{}]",
+                        data.request_address, data.handshake_port, data.notify_port
                     );
                 }
             }
             "D" => {
                 let mut decode = decode_instances.lock().unwrap();
-                let is_new = !decode.contains_key(&data.http_address);
-                decode.insert(data.http_address.clone(), instance);
+                let is_new = !decode.contains_key(&data.request_address);
+                decode.insert(data.request_address.clone(), instance);
 
                 if is_new {
                     info!(
-                        "🔵Add Decode [HTTP:{}, ZMQ:{}]",
-                        data.http_address, data.zmq_address
+                        "🔵Add Decode [HTTP:{}, handshake:{}, notify:{}]",
+                        data.request_address, data.handshake_port, data.notify_port
                     );
                 } else {
                     debug!(
-                        "🔄Update Decode [HTTP:{}, ZMQ:{}]",
-                        data.http_address, data.zmq_address
+                        "🔄Update Decode [HTTP:{}, handshake:{}, notify:{}]",
+                        data.request_address, data.handshake_port, data.notify_port
                     );
                 }
             }
             _ => {
                 warn!(
-                    "Unknown service type '{}' from {}",
-                    data.service_type, remote_addr_str
+                    "Unknown role '{}' from {}",
+                    data.role, remote_addr_str
                 );
             }
         }
