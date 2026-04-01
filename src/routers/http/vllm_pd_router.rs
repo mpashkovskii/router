@@ -427,23 +427,28 @@ impl VllmPDRouter {
             prefill_http
         );
 
-        // Extract dp_rank from prefill_http if intra_node_data_parallel_size > 1
-        let (prefill_base_http, prefill_dp_rank) = if self.intra_node_data_parallel_size > 1 {
-            let prefill_url = format!("http://{}", prefill_http);
-            let (base, rank) = dp_utils::parse_worker_url(&prefill_url);
-            let base_http = base.replace("http://", "").replace("https://", "");
-            (base_http, rank)
+        // prefill_http is already a full URL from vLLM's request_address (e.g., "http://10.21.9.8:9500/v1/completions")
+        // Extract dp_rank if needed, but keep the URL as-is
+        let (prefill_url, prefill_dp_rank) = if self.intra_node_data_parallel_size > 1 {
+            let (base, rank) = dp_utils::parse_worker_url(prefill_http);
+            (base, rank)
         } else {
             (prefill_http.to_string(), None)
         };
 
+        // Extract base URL without path for profiling
+        let prefill_base_for_profiling = prefill_url
+            .split("/v1/")
+            .next()
+            .unwrap_or(&prefill_url);
+
         // Start profiling on prefill server
-        self.start_profiling(&format!("http://{}", prefill_base_http))
+        self.start_profiling(prefill_base_for_profiling)
             .await;
 
         let mut prefill_request_builder = self
             .http_client
-            .post(format!("http://{}{}", prefill_base_http, path))
+            .post(&prefill_url) // Use full URL as-is, don't add path
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // P2P coordination metadata in header
 
@@ -457,7 +462,7 @@ impl VllmPDRouter {
             );
         }
 
-        let prefill_request_url = format!("http://{}{}", prefill_base_http, path);
+        let prefill_request_url = prefill_url.clone(); // Already a full URL
         let prefill_response = match otel_http::send_client_request(
             prefill_request_builder.body(prefill_request_str),
             headers,
@@ -536,32 +541,37 @@ impl VllmPDRouter {
             .map_err(|e| format!("Failed to serialize decode request: {}", e))?;
 
         // Stop profiling on prefill server after its work is done
-        self.stop_profiling(&format!("http://{}", prefill_base_http))
+        self.stop_profiling(prefill_base_for_profiling)
             .await;
 
         // Stage 2: Send to decode server with original request and same P2P coordination header
         debug!(
-            "Stage 2: Sending original request to decode server at http://{}",
+            "Stage 2: Sending original request to decode server at {}",
             decode_http
         );
 
-        // Extract dp_rank from decode_http if intra_node_data_parallel_size > 1
-        let (decode_base_http, decode_dp_rank) = if self.intra_node_data_parallel_size > 1 {
-            let decode_url = format!("http://{}", decode_http);
-            let (base, rank) = dp_utils::parse_worker_url(&decode_url);
-            let base_http = base.replace("http://", "").replace("https://", "");
-            (base_http, rank)
+        // decode_http is already a full URL from vLLM's request_address
+        // Extract dp_rank if needed, but keep the URL as-is
+        let (decode_url, decode_dp_rank) = if self.intra_node_data_parallel_size > 1 {
+            let (base, rank) = dp_utils::parse_worker_url(decode_http);
+            (base, rank)
         } else {
             (decode_http.to_string(), None)
         };
 
+        // Extract base URL without path for profiling
+        let decode_base_for_profiling = decode_url
+            .split("/v1/")
+            .next()
+            .unwrap_or(&decode_url);
+
         // Start profiling on decode server
-        self.start_profiling(&format!("http://{}", decode_base_http))
+        self.start_profiling(decode_base_for_profiling)
             .await;
 
         let mut decode_request_builder = self
             .http_client
-            .post(format!("http://{}{}", decode_base_http, path))
+            .post(&decode_url) // Use full URL as-is, don't add path
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // Same P2P coordination metadata in header
 
@@ -575,7 +585,7 @@ impl VllmPDRouter {
             );
         }
 
-        let decode_request_url = format!("http://{}{}", decode_base_http, path);
+        let decode_request_url = decode_url.clone(); // Already a full URL
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.body(decode_request_str),
             headers,
@@ -609,7 +619,7 @@ impl VllmPDRouter {
         );
 
         // Stop profiling on decode server after response received
-        self.stop_profiling(&format!("http://{}", decode_base_http))
+        self.stop_profiling(decode_base_for_profiling)
             .await;
 
         // Record PD metrics
