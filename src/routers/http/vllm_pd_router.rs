@@ -518,24 +518,51 @@ impl VllmPDRouter {
         let prefill_response_json: Value = serde_json::from_str(&prefill_response_text)
             .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
 
-        // Extract kv_transfer_params from prefill response if present
-        let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
+        // Extract kv_transfer_params from prefill response (contains remote_engine_id and remote_block_ids)
+        let prefill_kv_params = prefill_response_json.get("kv_transfer_params");
 
-        if let Some(ref params) = kv_transfer_params {
+        // Parse prefill instance's ZMQ metadata
+        let (prefill_handshake_port, prefill_notify_port) = Self::parse_zmq_metadata(prefill_zmq);
+
+        // Extract prefill IP from HTTP address
+        let prefill_ip = prefill_http
+            .split("://")
+            .nth(1)
+            .unwrap_or(prefill_http)
+            .split(':')
+            .next()
+            .unwrap_or("localhost");
+
+        // Build kv_transfer_params for decode request (pointing to prefill instance)
+        let mut decode_kv_params = json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "remote_handshake_port": prefill_handshake_port,
+            "remote_notify_port": prefill_notify_port,
+            "remote_engine_id": serde_json::Value::Null,
+            "remote_block_ids": serde_json::Value::Null,
+            "remote_host": prefill_ip,
+            "remote_port": prefill_handshake_port
+        });
+
+        // If prefill response contains engine_id and block_ids, add them
+        if let Some(prefill_params) = prefill_kv_params {
+            if let Some(engine_id) = prefill_params.get("remote_engine_id") {
+                decode_kv_params["remote_engine_id"] = engine_id.clone();
+            }
+            if let Some(block_ids) = prefill_params.get("remote_block_ids") {
+                decode_kv_params["remote_block_ids"] = block_ids.clone();
+            }
             debug!(
-                "Extracted kv_transfer_params from prefill response: {}",
-                serde_json::to_string_pretty(params).unwrap_or_default()
+                "Extracted engine_id and block_ids from prefill response: {}",
+                serde_json::to_string_pretty(prefill_params).unwrap_or_default()
             );
-        } else {
-            debug!("No kv_transfer_params found in prefill response, will proceed without them");
         }
 
-        // Prepare decode request with kv_transfer_params from prefill response at top level
+        // Prepare decode request with kv_transfer_params pointing to prefill
         let mut decode_request = request_json.clone();
-        if let Some(params) = kv_transfer_params {
-            decode_request["kv_transfer_params"] = params;
-            debug!("Added kv_transfer_params to decode request");
-        }
+        decode_request["kv_transfer_params"] = decode_kv_params;
+        debug!("Added kv_transfer_params to decode request with prefill metadata");
 
         let decode_request_str = serde_json::to_string(&decode_request)
             .map_err(|e| format!("Failed to serialize decode request: {}", e))?;
