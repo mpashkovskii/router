@@ -406,6 +406,7 @@ impl VllmPDRouter {
         // Add kv_transfer_params for MoRIIO support at top level
         // This enables the prefill instance to prepare for remote decode
         prefill_request["kv_transfer_params"] = json!({
+            "transfer_id": request_id,
             "do_remote_decode": true,
             "do_remote_prefill": false,
             "remote_handshake_port": decode_handshake_port,
@@ -535,6 +536,7 @@ impl VllmPDRouter {
 
         // Build kv_transfer_params for decode request (pointing to prefill instance)
         let mut decode_kv_params = json!({
+            "transfer_id": request_id,
             "do_remote_decode": false,
             "do_remote_prefill": true,
             "remote_handshake_port": prefill_handshake_port,
