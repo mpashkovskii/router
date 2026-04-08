@@ -58,6 +58,29 @@ impl VllmPDRouter {
         )
     }
 
+    /// Parse ZMQ metadata string to extract handshake and notify ports
+    /// Format: "handshake:6301,notify:61005"
+    fn parse_zmq_metadata(zmq_metadata: &str) -> (u16, u16) {
+        let mut handshake_port = 6301; // Default
+        let mut notify_port = 61005;   // Default
+
+        for part in zmq_metadata.split(',') {
+            let kv: Vec<&str> = part.split(':').collect();
+            if kv.len() == 2 {
+                let key = kv[0].trim();
+                if let Ok(port) = kv[1].trim().parse::<u16>() {
+                    match key {
+                        "handshake" => handshake_port = port,
+                        "notify" => notify_port = port,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        (handshake_port, notify_port)
+    }
+
     /// Get ZMQ address for a worker URL using service discovery
     fn get_zmq_address(&self, http_url: &str, service_type: ServiceType) -> String {
         // Extract just the host:port from the URL
@@ -368,15 +391,30 @@ impl VllmPDRouter {
         // Prepare prefill request (max_tokens=1 to force prefill-only mode)
         let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
 
-        // Add kv_transfer_params for NixlConnector support at top level
+        // Parse decode instance's ZMQ metadata (format: "handshake:6301,notify:61005")
+        let (decode_handshake_port, decode_notify_port) = Self::parse_zmq_metadata(decode_zmq);
+
+        // Extract decode IP from HTTP address
+        let decode_ip = decode_http
+            .split("://")
+            .nth(1)
+            .unwrap_or(decode_http)
+            .split(':')
+            .next()
+            .unwrap_or("localhost");
+
+        // Add kv_transfer_params for MoRIIO support at top level
         // This enables the prefill instance to prepare for remote decode
         prefill_request["kv_transfer_params"] = json!({
+            "transfer_id": request_id,
             "do_remote_decode": true,
             "do_remote_prefill": false,
+            "remote_handshake_port": decode_handshake_port,
+            "remote_notify_port": decode_notify_port,
             "remote_engine_id": serde_json::Value::Null,
             "remote_block_ids": serde_json::Value::Null,
-            "remote_host": serde_json::Value::Null,
-            "remote_port": serde_json::Value::Null
+            "remote_host": decode_ip,
+            "remote_port": decode_handshake_port  // Use handshake port as remote_port
         });
 
         debug!("Added kv_transfer_params to prefill request for NixlConnector support");
@@ -390,23 +428,28 @@ impl VllmPDRouter {
             prefill_http
         );
 
-        // Extract dp_rank from prefill_http if intra_node_data_parallel_size > 1
-        let (prefill_base_http, prefill_dp_rank) = if self.intra_node_data_parallel_size > 1 {
-            let prefill_url = format!("http://{}", prefill_http);
-            let (base, rank) = dp_utils::parse_worker_url(&prefill_url);
-            let base_http = base.replace("http://", "").replace("https://", "");
-            (base_http, rank)
+        // prefill_http is already a full URL from vLLM's request_address (e.g., "http://10.21.9.8:9500/v1/completions")
+        // Extract dp_rank if needed, but keep the URL as-is
+        let (prefill_url, prefill_dp_rank) = if self.intra_node_data_parallel_size > 1 {
+            let (base, rank) = dp_utils::parse_worker_url(prefill_http);
+            (base, rank)
         } else {
             (prefill_http.to_string(), None)
         };
 
+        // Extract base URL without path for profiling
+        let prefill_base_for_profiling = prefill_url
+            .split("/v1/")
+            .next()
+            .unwrap_or(&prefill_url);
+
         // Start profiling on prefill server
-        self.start_profiling(&format!("http://{}", prefill_base_http))
+        self.start_profiling(prefill_base_for_profiling)
             .await;
 
         let mut prefill_request_builder = self
             .http_client
-            .post(format!("http://{}{}", prefill_base_http, path))
+            .post(&prefill_url) // Use full URL as-is, don't add path
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // P2P coordination metadata in header
 
@@ -420,7 +463,7 @@ impl VllmPDRouter {
             );
         }
 
-        let prefill_request_url = format!("http://{}{}", prefill_base_http, path);
+        let prefill_request_url = prefill_url.clone(); // Already a full URL
         let prefill_response = match otel_http::send_client_request(
             prefill_request_builder.body(prefill_request_str),
             headers,
@@ -476,55 +519,88 @@ impl VllmPDRouter {
         let prefill_response_json: Value = serde_json::from_str(&prefill_response_text)
             .map_err(|e| format!("Failed to parse prefill response as JSON: {}", e))?;
 
-        // Extract kv_transfer_params from prefill response if present
-        let kv_transfer_params = prefill_response_json.get("kv_transfer_params").cloned();
+        // Extract kv_transfer_params from prefill response (contains remote_engine_id and remote_block_ids)
+        let prefill_kv_params = prefill_response_json.get("kv_transfer_params");
 
-        if let Some(ref params) = kv_transfer_params {
+        // Parse prefill instance's ZMQ metadata
+        let (prefill_handshake_port, prefill_notify_port) = Self::parse_zmq_metadata(prefill_zmq);
+
+        // Extract prefill IP from HTTP address
+        let prefill_ip = prefill_http
+            .split("://")
+            .nth(1)
+            .unwrap_or(prefill_http)
+            .split(':')
+            .next()
+            .unwrap_or("localhost");
+
+        // Build kv_transfer_params for decode request (pointing to prefill instance)
+        let mut decode_kv_params = json!({
+            "transfer_id": request_id,
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "remote_handshake_port": prefill_handshake_port,
+            "remote_notify_port": prefill_notify_port,
+            "remote_engine_id": serde_json::Value::Null,
+            "remote_block_ids": serde_json::Value::Null,
+            "remote_host": prefill_ip,
+            "remote_port": prefill_handshake_port
+        });
+
+        // If prefill response contains engine_id and block_ids, add them
+        if let Some(prefill_params) = prefill_kv_params {
+            if let Some(engine_id) = prefill_params.get("remote_engine_id") {
+                decode_kv_params["remote_engine_id"] = engine_id.clone();
+            }
+            if let Some(block_ids) = prefill_params.get("remote_block_ids") {
+                decode_kv_params["remote_block_ids"] = block_ids.clone();
+            }
             debug!(
-                "Extracted kv_transfer_params from prefill response: {}",
-                serde_json::to_string_pretty(params).unwrap_or_default()
+                "Extracted engine_id and block_ids from prefill response: {}",
+                serde_json::to_string_pretty(prefill_params).unwrap_or_default()
             );
-        } else {
-            debug!("No kv_transfer_params found in prefill response, will proceed without them");
         }
 
-        // Prepare decode request with kv_transfer_params from prefill response at top level
+        // Prepare decode request with kv_transfer_params pointing to prefill
         let mut decode_request = request_json.clone();
-        if let Some(params) = kv_transfer_params {
-            decode_request["kv_transfer_params"] = params;
-            debug!("Added kv_transfer_params to decode request");
-        }
+        decode_request["kv_transfer_params"] = decode_kv_params;
+        debug!("Added kv_transfer_params to decode request with prefill metadata");
 
         let decode_request_str = serde_json::to_string(&decode_request)
             .map_err(|e| format!("Failed to serialize decode request: {}", e))?;
 
         // Stop profiling on prefill server after its work is done
-        self.stop_profiling(&format!("http://{}", prefill_base_http))
+        self.stop_profiling(prefill_base_for_profiling)
             .await;
 
         // Stage 2: Send to decode server with original request and same P2P coordination header
         debug!(
-            "Stage 2: Sending original request to decode server at http://{}",
+            "Stage 2: Sending original request to decode server at {}",
             decode_http
         );
 
-        // Extract dp_rank from decode_http if intra_node_data_parallel_size > 1
-        let (decode_base_http, decode_dp_rank) = if self.intra_node_data_parallel_size > 1 {
-            let decode_url = format!("http://{}", decode_http);
-            let (base, rank) = dp_utils::parse_worker_url(&decode_url);
-            let base_http = base.replace("http://", "").replace("https://", "");
-            (base_http, rank)
+        // decode_http is already a full URL from vLLM's request_address
+        // Extract dp_rank if needed, but keep the URL as-is
+        let (decode_url, decode_dp_rank) = if self.intra_node_data_parallel_size > 1 {
+            let (base, rank) = dp_utils::parse_worker_url(decode_http);
+            (base, rank)
         } else {
             (decode_http.to_string(), None)
         };
 
+        // Extract base URL without path for profiling
+        let decode_base_for_profiling = decode_url
+            .split("/v1/")
+            .next()
+            .unwrap_or(&decode_url);
+
         // Start profiling on decode server
-        self.start_profiling(&format!("http://{}", decode_base_http))
+        self.start_profiling(decode_base_for_profiling)
             .await;
 
         let mut decode_request_builder = self
             .http_client
-            .post(format!("http://{}{}", decode_base_http, path))
+            .post(&decode_url) // Use full URL as-is, don't add path
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // Same P2P coordination metadata in header
 
@@ -538,7 +614,7 @@ impl VllmPDRouter {
             );
         }
 
-        let decode_request_url = format!("http://{}{}", decode_base_http, path);
+        let decode_request_url = decode_url.clone(); // Already a full URL
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.body(decode_request_str),
             headers,
@@ -572,7 +648,7 @@ impl VllmPDRouter {
         );
 
         // Stop profiling on decode server after response received
-        self.stop_profiling(&format!("http://{}", decode_base_http))
+        self.stop_profiling(decode_base_for_profiling)
             .await;
 
         // Record PD metrics
@@ -636,7 +712,9 @@ impl VllmPDRouter {
 
             Ok(response)
         } else {
-            // No logprobs merging needed - return decode response as-is
+            // No logprobs merging needed - stream decode response as-is (handles both streaming
+            // and non-streaming). Using bytes_stream() avoids buffering the entire SSE stream
+            // into memory, which would cause streaming requests to return an empty reply.
             debug!(
                 "No logprobs merging needed (streaming={}, needs_logprobs={})",
                 is_streaming, needs_logprobs
@@ -644,18 +722,19 @@ impl VllmPDRouter {
 
             let status = decode_response.status();
             let headers = decode_response.headers().clone();
-            let body = decode_response
-                .bytes()
-                .await
-                .map_err(|e| format!("Failed to read decode response: {}", e))?;
 
             let mut response_builder = axum::http::Response::builder().status(status);
             for (name, value) in headers.iter() {
-                response_builder = response_builder.header(name, value);
+                // Skip hop-by-hop headers that must not be forwarded as-is; axum will
+                // set transfer-encoding and content-length correctly for the streamed body.
+                if name != "transfer-encoding" && name != "content-length" {
+                    response_builder = response_builder.header(name, value);
+                }
             }
 
+            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
             let response = response_builder
-                .body(axum::body::Body::from(body))
+                .body(body)
                 .map_err(|e| format!("Failed to build response: {}", e))?;
 
             Ok(response)
